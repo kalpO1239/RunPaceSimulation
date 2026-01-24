@@ -1,122 +1,170 @@
-# pace_simulation.py
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.optimize import minimize
 
 # -------------------------
-# PARAMETERS (tune these)
+# PARAMETERS (initial guesses)
 # -------------------------
-alpha = 0.01    # fatigue from power
-delta = 0.005   # fatigue from FPR
-epsilon = 0.002 # fatigue from GCT
-beta = 0.05     # natural recovery of fatigue
+alpha = 0.05
+delta = 0.02
+epsilon = 0.01
+beta = 0.05
 
-gamma = 0.02    # energy cost from power
-eta = 0.1       # energy cost sensitivity to grade
+gamma = 0.001
+phi = 0.01
+eta = 0.1
 
-kappa0 = 5.0   # base pace (min/mile)
-kappa1 = 0.1   # fatigue coefficient
-kappa2 = 0.05  # FPR coefficient
-kappa3 = 0.2   # grade coefficient
-lam = 1.0      # energy exponent
+# Constants to train
+kappa0 = 3.5
+kappa2 = 0.1
+kappa3 = 0.1
+kappa4 = 0.005
+lam = 1.2
 
-dt = 1.0       # time step, in seconds
+dt = 1  # seconds
 
+speed_bias = 0.5
 # -------------------------
 # STATE VECTOR
 # -------------------------
 class RunnerState:
     def __init__(self, fatigue=0.0, energy=1.0):
-        self.F = fatigue  # Fatigue
-        self.E = energy   # Expendable energy (fraction of total)
+        self.F = fatigue
+        self.E = energy
 
 # -------------------------
 # DISCRETIZED ODE UPDATE
 # -------------------------
 def update_state(state, Pt, FPRt, GCTt, grade_t):
-    """Evolve state vector one timestep."""
-    # Fatigue
-    F_next = state.F + dt * (alpha*Pt + delta*FPRt + epsilon*GCTt - beta*state.F)
-    
-    # Expendable Energy
-    E_next = state.E + dt * (-gamma*Pt*(1 + eta*abs(grade_t)))
-    
-    # Keep energy within [0,1]
-    E_next = max(min(E_next, 1.0), 0.0)
-    
-    return RunnerState(fatigue=F_next, energy=E_next)
+    F_next = state.F + dt * (
+        alpha * Pt
+        + delta * FPRt
+        + epsilon * GCTt
+        - beta * state.F
+    )
+
+    E_next = state.E + dt * (
+        -gamma * Pt * (1 + eta * abs(grade_t))
+        + phi
+    )
+
+    E_next = np.clip(E_next, 0.0, 1.0)
+    return RunnerState(F_next, E_next)
 
 # -------------------------
-# OBSERVATION EQUATION
+# NORMALIZE FEATURES
 # -------------------------
-def pace_observation(state, Pt, FPRt, grade_t):
-    """Compute pace from state vector and inputs."""
-    pace = (kappa0 + kappa1*state.F + kappa2*FPRt + kappa3*abs(grade_t)) / (Pt * state.E**lam)
-    return pace
+def normalize_features(df):
+    df = df.copy()
+    df['Pt'] /= df['Pt'].max()
+    df['FPR'] /= df['FPR'].max()
+    df['GCT'] /= df['GCT'].max()
+    df['Cadence'] /= df['Cadence'].max()
+    df['Grade'] /= df['Grade'].abs().max() if df['Grade'].abs().max() > 0 else 1
+    return df
+
+# -------------------------
+# OBSERVATION EQUATION (FIXED)
+# -------------------------
+def speed_observation(state, Pt, FPRt, grade_t, Cadence_t,
+                      k0, k2, k3, k4, lam, b):
+
+    effective_energy = state.E * (1 - state.F)
+
+    speed = (
+        Pt * (1 + effective_energy)**lam
+    ) / (
+        k0
+        + k2 * FPRt
+        + k3 * abs(grade_t)
+        + k4 * Cadence_t
+    )
+
+    return speed + b 
+
+
+# -------------------------
+# PREPROCESS STRYD DATA
+# -------------------------
+def preprocess_stryd(csv_path):
+    df = pd.read_csv(csv_path)
+    df = df[df['Power (w/kg)'] > 0].copy()
+
+    df['FPR'] = df['Form Power (w/kg)'] / df['Power (w/kg)']
+
+    elevation_diff = df['Watch Elevation (m)'].diff().fillna(0)
+    horizontal_diff = df['Watch Distance (meters)'].diff().replace(0, np.nan)
+    df['Grade'] = (elevation_diff / horizontal_diff).fillna(0)
+
+    df['Pt'] = df['Power (w/kg)']
+    df['GCT'] = df['Ground Time (ms)'] / 1000.0
+    df['Cadence'] = df['Cadence (spm)']
+
+    df = normalize_features(df)
+    return df
 
 # -------------------------
 # SIMULATION LOOP
 # -------------------------
-def simulate_run(data):
-    """
-    data: pandas DataFrame with columns ['Power', 'FPR', 'GCT', 'Grade']
-    """
-    n_steps = len(data)
+def simulate_run(df, k0, k2, k3, k4, lam, b):
     states = [RunnerState()]
-    paces = []
+    speeds = []
 
-    for i in range(n_steps):
-        Pt = data.loc[i, 'Power']
-        FPRt = data.loc[i, 'FPR']
-        GCTt = data.loc[i, 'GCT']
-        grade_t = data.loc[i, 'Grade']
+    for i in range(len(df)):
+        row = df.iloc[i]
+        state = states[-1]
 
-        # Compute pace from previous state
-        pace = pace_observation(states[-1], Pt, FPRt, grade_t)
-        paces.append(pace)
+        speed = speed_observation(
+            state,
+            row['Pt'], row['FPR'], row['Grade'], row['Cadence'],
+            k0, k2, k3, k4, lam, b
+        )
+        speeds.append(speed)
 
-        # Update state
-        next_state = update_state(states[-1], Pt, FPRt, GCTt, grade_t)
-        states.append(next_state)
+        states.append(
+            update_state(
+                state,
+                row['Pt'], row['FPR'], row['GCT'], row['Grade']
+            )
+        )
 
-    return paces, states[1:]  # skip initial state in output
-
-# -------------------------
-# VISUALIZATION
-# -------------------------
-def plot_results(paces, states):
-    times = np.arange(len(paces))
-    F = [s.F for s in states]
-    E = [s.E for s in states]
-
-    fig, ax1 = plt.subplots()
-
-    ax1.plot(times, paces, 'r-', label='Pace')
-    ax1.set_xlabel('Time step')
-    ax1.set_ylabel('Pace', color='r')
-    ax1.tick_params(axis='y', labelcolor='r')
-
-    ax2 = ax1.twinx()
-    ax2.plot(times, F, 'b--', label='Fatigue')
-    ax2.plot(times, E, 'g-.', label='Energy')
-    ax2.set_ylabel('State', color='k')
-    ax2.tick_params(axis='y', labelcolor='k')
-
-    fig.tight_layout()
-    plt.legend()
-    plt.show()
+    return speeds, states
 
 # -------------------------
-# MAIN FUNCTION (example)
+# LOSS FUNCTION
+# -------------------------
+def loss(params, df):
+    k0, k2, k3, k4, lam, b = params
+    pred, _ = simulate_run(df, k0, k2, k3, k4, lam, b)
+    return np.mean((np.array(pred) - df['Watch Speed (m/s)'].values) ** 2)
+
+
+# -------------------------
+# MAIN
 # -------------------------
 if __name__ == "__main__":
-    # Example data: replace with Stryd pod CSV
-    example_data = pd.DataFrame({
-        'Power': np.random.normal(250, 10, 300),
-        'FPR': np.random.normal(0.25, 0.02, 300),
-        'GCT': np.random.normal(0.25, 0.01, 300),
-        'Grade': np.zeros(300)
-    })
+    df_train = preprocess_stryd("Run2.csv")
 
-    paces, states = simulate_run(example_data)
-    plot_results(paces, states)
+    init = [kappa0, kappa2, kappa3, kappa4, lam, speed_bias]
+    bounds = [
+    (1e-3, None),  # k0
+    (0, None),     # k2
+    (0, None),     # k3
+    (0, None),     # k4
+    (0.5, 3.0),    # lam
+    (-2.0, 2.0)    # speed bias (m/s)
+    ]
+
+
+    res = minimize(loss, init, args=(df_train,), bounds=bounds)
+    k0, k2, k3, k4, lam, b = res.x
+    print("Trained params:", res.x)
+
+    df_test = preprocess_stryd("Run3.csv")
+    pred, states = simulate_run(df_test, k0, k2, k3, k4, lam, b)
+
+    plt.plot(df_test['Watch Speed (m/s)'], label="Observed")
+    plt.plot(pred, label="Predicted")
+    plt.legend()
+    plt.show()
