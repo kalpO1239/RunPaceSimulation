@@ -4,6 +4,7 @@
 ## Overview:
 
 This project models running pace as an observation of a dynamical system, inspired by how weather models (e.g., the GFS) forecast future states rather than directly predicting observations. Similarly, instead of predicting speed outright, the runner is treated as a system with states—-fatigue and energy—-that evolve over time according to differential equations. Speed then emerges as an observation of these states.
+
 ---
 
 ## Core Idea:
@@ -23,6 +24,7 @@ The runner’s state updates each second via discretized ODEs (Euler Step).
 Speed is found from power and other biomechanics, modulated by the runner’s current fatigue and energy.
 
 This mirrors weather modeling: the system state is propagated forward, and observations are derived from that state.
+
 ---
 
 ## What the Code Does:
@@ -36,6 +38,7 @@ Learns model parameters by minimizing prediction error (MSE) across multiple run
 Outputs predicted vs. observed speed
 
 Allows for forecasting future speed and internal states starting from a given condition
+
 ---
 
 ## Interpretation & Limitations:
